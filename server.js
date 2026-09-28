@@ -1,91 +1,118 @@
-const express = require('express');
-const cors    = require('cors');
-const fs      = require('fs');
-const path    = require('path');
+const express    = require('express');
+const cors       = require('cors');
+const path       = require('path');
+const { MongoClient } = require('mongodb');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
 
-// ── Data file path ──────────────────────────────────────────
-// On Render with a Persistent Disk mounted at /data,
-// this keeps data across deploys. Locally it stores in the
-// same folder as server.js.
-const DATA_DIR  = process.env.DATA_DIR || path.join(__dirname, 'data');
-const DATA_FILE = path.join(DATA_DIR, 'projects.json');
-
-// Ensure data directory and file exist
-if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
-if (!fs.existsSync(DATA_FILE)) fs.writeFileSync(DATA_FILE, JSON.stringify([]), 'utf8');
-
-// ── Helpers ────────────────────────────────────────────────
-function readProjects() {
-  try {
-    const raw = fs.readFileSync(DATA_FILE, 'utf8');
-    return JSON.parse(raw) || [];
-  } catch {
-    return [];
-  }
+// ── MongoDB Setup ─────────────────────────────────────────────
+// Set MONGODB_URI in your Render environment variables
+const MONGODB_URI = process.env.MONGODB_URI;
+if (!MONGODB_URI) {
+  console.error('❌ MONGODB_URI environment variable is not set!');
+  process.exit(1);
 }
 
-function writeProjects(data) {
-  fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2), 'utf8');
+const client = new MongoClient(MONGODB_URI);
+let projectsCol;
+
+async function connectDB() {
+  await client.connect();
+  const db    = client.db('royal_eye_solar');
+  projectsCol = db.collection('projects');
+  console.log('✅ Connected to MongoDB Atlas');
 }
 
-// ── Middleware ────────────────────────────────────────────
+// ── Middleware ────────────────────────────────────────────────
 app.use(cors());
 app.use(express.json());
 
 // Serve static frontend files from the same folder
 app.use(express.static(__dirname));
 
-// ── API Routes ────────────────────────────────────────────
+// ── API Routes ────────────────────────────────────────────────
 
 // GET all projects
-app.get('/api/projects', (req, res) => {
-  res.json(readProjects());
+app.get('/api/projects', async (req, res) => {
+  try {
+    const projects = await projectsCol
+      .find({})
+      .sort({ createdAt: -1 })
+      .toArray();
+    // Strip MongoDB's _id, keep our own string id
+    res.json(projects.map(({ _id, ...rest }) => rest));
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Database error' });
+  }
 });
 
 // POST — create new project
-app.post('/api/projects', (req, res) => {
-  const projects = readProjects();
-  const project  = {
-    id:        Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
-    createdAt: new Date().toISOString(),
-    updatedAt: new Date().toISOString(),
-    ...req.body,
-  };
-  projects.unshift(project);   // newest first
-  writeProjects(projects);
-  res.status(201).json(project);
+app.post('/api/projects', async (req, res) => {
+  try {
+    const project = {
+      id:        Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      ...req.body,
+    };
+    await projectsCol.insertOne(project);
+    const { _id, ...saved } = project;
+    res.status(201).json(saved);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Database error' });
+  }
 });
 
 // PUT — update existing project
-app.put('/api/projects/:id', (req, res) => {
-  const projects = readProjects();
-  const idx      = projects.findIndex(p => p.id === req.params.id);
-  if (idx === -1) return res.status(404).json({ error: 'Project not found' });
-  projects[idx] = { ...projects[idx], ...req.body, updatedAt: new Date().toISOString() };
-  writeProjects(projects);
-  res.json(projects[idx]);
+app.put('/api/projects/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const update = { ...req.body, updatedAt: new Date().toISOString() };
+    delete update.id; // don't overwrite the id field
+
+    const result = await projectsCol.findOneAndUpdate(
+      { id },
+      { $set: update },
+      { returnDocument: 'after' }
+    );
+
+    if (!result) return res.status(404).json({ error: 'Project not found' });
+    const { _id, ...rest } = result;
+    res.json(rest);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Database error' });
+  }
 });
 
 // DELETE — remove project
-app.delete('/api/projects/:id', (req, res) => {
-  let projects = readProjects();
-  const len    = projects.length;
-  projects     = projects.filter(p => p.id !== req.params.id);
-  if (projects.length === len) return res.status(404).json({ error: 'Project not found' });
-  writeProjects(projects);
-  res.json({ success: true });
+app.delete('/api/projects/:id', async (req, res) => {
+  try {
+    const result = await projectsCol.deleteOne({ id: req.params.id });
+    if (result.deletedCount === 0) return res.status(404).json({ error: 'Project not found' });
+    res.json({ success: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Database error' });
+  }
 });
 
-// ── Catch-all — serve index.html for any unknown route ───
+// ── Catch-all — serve index.html for any unknown route ────────
 app.get('*', (req, res) => {
   res.sendFile(path.join(__dirname, 'index.html'));
 });
 
-// ── Start server ─────────────────────────────────────────
-app.listen(PORT, () => {
-  console.log(`✅ Royal Eye Solar Tracker running on port ${PORT}`);
-  console.log(`📁 Data stored at: ${DATA_FILE}`);
-});
+// ── Start server ──────────────────────────────────────────────
+connectDB()
+  .then(() => {
+    app.listen(PORT, () => {
+      console.log(`✅ Royal Eye Solar Tracker running on port ${PORT}`);
+    });
+  })
+  .catch(err => {
+    console.error('❌ Failed to connect to MongoDB:', err);
+    process.exit(1);
+  });
